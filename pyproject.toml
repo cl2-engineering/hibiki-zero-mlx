@@ -25,6 +25,9 @@ training = [
     "transformers",
 ]
 
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu130"
+
 [tool.ruff]
 line-length = 100
 
@@ -38,6 +41,3 @@ override-dependencies = [
     "safetensors>=0.4.0",
     "sounddevice>=0.5",
 ]
-
-[[tool.uv.index]]
-url = "https://download.pytorch.org/whl/cu130"
