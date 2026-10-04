@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-"""Hibiki-Zero file translation on CUDA (PyTorch, bf16).
+"""Hibiki-Zero translation on CUDA (PyTorch, bf16), from a file or live microphone.
 
+  .venv/bin/python main.py                                 # live: microphone -> speaker
   .venv/bin/python main.py input.wav                       # upstream weights/
   .venv/bin/python main.py input.wav --checkpoint finetune/runs/ewe_full/best.safetensors
   .venv/bin/python main.py input.wav --config student/configs/hibiki_m_12l_ar.json \\
@@ -9,11 +10,15 @@
 Writes the translated 24 kHz speech (default translations/<stem>_translated.wav)
 and its text (default: the wav path with .txt). An 8 s silence tail flushes the
 simultaneous-translation lag; generation stops at the text EOS.
+Live mode streams 80 ms frames until Ctrl+C; use headphones to avoid echo.
 """
 import argparse
 import json
+import queue
 import time
 from pathlib import Path
+
+import numpy as np
 
 import sphn
 import torch
@@ -102,9 +107,57 @@ def translate(args: argparse.Namespace) -> None:
     )
 
 
+def live(args: argparse.Namespace) -> None:
+    import sounddevice as sd
+
+    _, lm_gen, mimi, tokenizer = load(args)
+    frame = int(mimi.sample_rate / mimi.frame_rate)
+    mic: queue.Queue[np.ndarray] = queue.Queue()
+    speaker: queue.Queue[np.ndarray] = queue.Queue()
+
+    def on_mic(indata, frames, time_info, status):
+        mic.put(indata[:, 0].copy())
+
+    def on_speaker(outdata, frames, time_info, status):
+        try:
+            outdata[:, 0] = speaker.get_nowait()
+        except queue.Empty:
+            outdata.fill(0)
+
+    def step(pcm: np.ndarray) -> torch.Tensor | None:
+        codes = mimi.encode(torch.from_numpy(pcm).to(args.device)[None, None])
+        tokens = lm_gen.step(codes[:, :, :1])
+        if tokens is not None:
+            speaker.put(mimi.decode(tokens[:, 1:])[0, 0].float().cpu().numpy())
+        return tokens
+
+    with torch.no_grad(), mimi.streaming(1), lm_gen.streaming(1):
+        for _ in range(lm_gen.max_delay + 4):  # compile / CUDA-graph warmup on silence
+            step(np.zeros(frame, dtype=np.float32))
+        torch.cuda.synchronize()
+        speaker.queue.clear()
+        stream_args = dict(
+            samplerate=mimi.sample_rate, blocksize=frame, channels=1, dtype="float32"
+        )
+        with sd.InputStream(device=args.input_device, callback=on_mic, **stream_args), \
+                sd.OutputStream(device=args.output_device, callback=on_speaker, **stream_args):
+            print("Listening... speak now (Ctrl+C to stop).\n", flush=True)
+            try:
+                while True:
+                    tokens = step(mic.get())
+                    if mic.qsize() > 5:
+                        print(f"\n[behind real time by {mic.qsize() * 80} ms]", flush=True)
+                    text = None if tokens is None else int(tokens[0, 0, 0])
+                    if text is not None and text not in (0, 3, tokenizer.eos_id()):
+                        piece = tokenizer.id_to_piece(text).replace("\u2581", " ")
+                        print(piece, end="", flush=True)
+            except KeyboardInterrupt:
+                print()
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Hibiki-Zero file translation (PyTorch CUDA)")
-    p.add_argument("input", help="audio file to translate")
+    p = argparse.ArgumentParser(description="Hibiki-Zero translation (PyTorch CUDA)")
+    p.add_argument("input", nargs="?", help="audio file to translate; omit for live microphone")
     p.add_argument("--checkpoint", type=Path, default=DEFAULT_MODEL_WEIGHT,
                    help="LM safetensors: upstream, finetune/train.py output, or student export")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="LM config.json")
@@ -113,9 +166,18 @@ def main() -> None:
     p.add_argument("--device", default="cuda")
     p.add_argument("--tail-s", type=float, default=8.0, help="silence appended to flush the lag")
     p.add_argument("--seed", type=int, default=299792458)
+    p.add_argument("--input-device", help="live mode microphone (sounddevice index or name)")
+    p.add_argument("--output-device", help="live mode speaker (sounddevice index or name)")
     args = p.parse_args()
+    for name in ("input_device", "output_device"):
+        value = getattr(args, name)
+        if value is not None and value.isdigit():
+            setattr(args, name, int(value))
     torch.manual_seed(args.seed)
-    translate(args)
+    if args.input:
+        translate(args)
+    else:
+        live(args)
 
 
 if __name__ == "__main__":

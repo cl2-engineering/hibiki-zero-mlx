@@ -11,7 +11,7 @@ Hibiki-Zero 3B, trained and run with PyTorch CUDA on a local NVIDIA GB10
 
 ## File map
 
-- `main.py`: file-only CUDA inference (bf16) for upstream, fine-tuned, AR-student
+- `main.py`: file or live-microphone CUDA inference (bf16) for upstream, fine-tuned, AR-student
   and `parallel_v1` checkpoints; 8 s silence tail, stops at text EOS.
 - `finetune/build_pairs.py`: manifest CSV → `finetune/pairs/{split}.jsonl`.
 - `finetune/cache_codes.py` + `text_timing.py`: Mimi codes and CTC-timed
@@ -36,7 +36,7 @@ Hibiki-Zero 3B, trained and run with PyTorch CUDA on a local NVIDIA GB10
 
 - Generic local manifest; English target audio is mandatory (no TTS).
 - No Hugging Face sync of caches or checkpoints; everything stays local.
-- CUDA only; file-only inference (no microphone or realtime path).
+- CUDA only; `main.py` with no input streams microphone -> speaker in 80 ms frames.
 - Every 3B parameter is trainable. Memory: ~53 GB peak at batch 1; checkpoints
   ~37 GB each (~110 GB with keep-2). Inference ~8 GB, ~1.34× real time.
 

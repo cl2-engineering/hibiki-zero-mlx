@@ -29,12 +29,16 @@ Download the upstream 3B weights (file names are what `finetune/utils.py` expect
 
 ## Inference
 
-File translation only:
-
 ```bash
-.venv/bin/python main.py assets/samples/leon.wav            # upstream weights
+.venv/bin/python main.py                                    # live: microphone -> speaker
+.venv/bin/python main.py assets/samples/leon.wav            # file, upstream weights
 .venv/bin/python main.py input.wav --checkpoint finetune/runs/ewe_full/best.safetensors
 ```
+
+Live mode streams 80 ms frames in real time on the GB10, plays the English speech,
+and prints the text until Ctrl+C. Use headphones: a speakerphone feeds the model's
+own output back into the mic. Pick devices with `--input-device` / `--output-device`
+(index or name from `python -m sounddevice`).
 
 Writes `translations/<stem>_translated.wav` and a `.txt` transcript (`-o`,
 `--text-out` override). Student checkpoints also need `--config`; see
@@ -73,7 +77,7 @@ The 12-layer mobile distillation track is in [student/README.md](student/README.
 
 ## Layout
 
-- `main.py`: CUDA file translation for upstream, fine-tuned, and student checkpoints.
+- `main.py`: CUDA file or live-microphone translation for upstream, fine-tuned, and student checkpoints.
 - `finetune/`: manifest → pairs → cache → full-model SFT → validation/eval.
 - `student/`: 12-layer AR and `parallel_v1` distillation.
 - `weights/`: upstream weights (gitignored).
