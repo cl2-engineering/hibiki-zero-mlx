@@ -45,7 +45,6 @@ Hibiki-Zero 3B, trained and run with PyTorch CUDA on a local NVIDIA GB10
 - Python: `.venv/bin/python` (uv, Python 3.13, torch 2.14.1+cu130). `uv sync
   --extra training` installs everything, including moshi 0.2.13 via
   `override-dependencies` for its stale pins.
-- AGENTS.md still names a macOS conda path; it does not apply on GB10.
 - The ignored `.env` may hold an HF token. Never print, log, or commit it.
 
 ## Canonical resources

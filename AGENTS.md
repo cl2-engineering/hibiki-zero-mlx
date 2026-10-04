@@ -14,5 +14,5 @@ Guidance for AI coding agents working in this repository.
 - Do not add `Co-Authored-By` or any AI attribution to commit messages.
 
 ## Tooling
-- For Python, use the conda base env at `/opt/homebrew/Caskroom/miniconda/base/bin/python` (Python 3.13, has project deps installed) so dont need to create __init__ files.
+- For Python, use the uv project env at `.venv/bin/python` (Python 3.13, has project deps installed; sync with `uv sync --extra training`) so dont need to create __init__ files.
 - When you need docs for a third-party library, SDK, or external service, fetch current API reference instead of relying on training data.
