@@ -1,1 +1,1 @@
-"""Vietnamese full-model SFT helpers for Hibiki-Zero."""
+"""Ewe-to-English full-model SFT helpers for Hibiki-Zero."""

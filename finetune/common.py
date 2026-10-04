@@ -1,17 +1,16 @@
-"""Shared training and evaluation logic for Vietnamese full-model SFT.
+"""Shared training and evaluation logic for Ewe->English full-model SFT.
 
 This module owns device helpers, the cached-shard dataset, exact full-model
 checkpoint I/O, teacher-forced losses, autoregressive generation, text metrics,
 and correct-source generation health diagnostics.
 
-It is a PyTorch training toolkit; torch, safetensors and the `moshi` pip package
-are hard dependencies imported at module top (the conda base env ships them).
+It is a CUDA PyTorch training toolkit; torch, safetensors and the `moshi` pip
+package are hard dependencies imported at module top.
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
@@ -24,10 +23,8 @@ from typing import Any
 
 import torch
 
-# moshi reads NO_TORCH_COMPILE once at import. Default-enable compile on CUDA:
-# The pinned CUDA build supports compiled H100 training. Keep it off elsewhere
-# (no gain on MPS).
-# Override with NO_TORCH_COMPILE=1.
+# moshi reads NO_TORCH_COMPILE once at import. Default-enable compile on CUDA;
+# override with NO_TORCH_COMPILE=1.
 os.environ.setdefault("NO_TORCH_COMPILE", "" if torch.cuda.is_available() else "1")
 
 import numpy as np
@@ -38,7 +35,7 @@ from moshi.run_inference import get_condition_tensors
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from finetune.cache_codes import CACHE_FORMAT, GROUNDED_CACHE_FORMAT
+from finetune.cache_codes import CACHE_FORMAT
 from finetune.hibiki_helpers import (
     audio_read,
     decode_outputs,
@@ -48,12 +45,10 @@ from finetune.hibiki_helpers import (
 )
 from finetune.utils import repo_display_path, require_file, resolve_repo_path
 
-SUPPORTED_CACHE_FORMATS = {CACHE_FORMAT, GROUNDED_CACHE_FORMAT}
 
 
 def ascii_text(text: str) -> str:
     """Remove Latin diacritics for stable word-metric normalization."""
-    text = text.replace("đ", "d").replace("Đ", "D")
     decomposed = unicodedata.normalize("NFKD", text)
     return "".join(char for char in decomposed if not unicodedata.combining(char)).encode(
         "ascii", "ignore"
@@ -64,8 +59,6 @@ def ascii_text(text: str) -> str:
 # Device / dtype / seeding
 # --------------------------------------------------------------------------- #
 def check_device(device_name: str) -> torch.device:
-    if device_name == "mps" and not torch.backends.mps.is_available():
-        raise RuntimeError("Requested --device mps, but torch.backends.mps is not available.")
     if device_name == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Requested --device cuda, but torch.cuda.is_available() is false.")
     return torch.device(device_name)
@@ -83,32 +76,14 @@ def seed_all(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    if torch.backends.mps.is_available() and hasattr(torch.mps, "manual_seed"):
-        torch.mps.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
 
-def is_mps(device: torch.device) -> bool:
-    return getattr(device, "type", str(device)) == "mps"
-
-
-def mps_memory_stats(device: torch.device) -> dict[str, float]:
-    if not is_mps(device):
+def cuda_memory_stats(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda":
         return {}
-    return {
-        "mps_allocated_gb": torch.mps.current_allocated_memory() / 1024**3,
-        "mps_driver_gb": torch.mps.driver_allocated_memory() / 1024**3,
-        "mps_recommended_gb": torch.mps.recommended_max_memory() / 1024**3,
-    }
-
-
-def empty_device_cache(device: torch.device) -> None:
-    """Synchronize + free cached memory. No-op off MPS so CUDA runs stay clean."""
-    if not is_mps(device):
-        return
-    torch.mps.synchronize()
-    torch.mps.empty_cache()
+    return {"cuda_max_allocated_gb": torch.cuda.max_memory_allocated(device) / 1024**3}
 
 
 class _CausalSDPA:
@@ -159,7 +134,7 @@ def enable_causal_sdpa() -> None:
 
 
 # Default-on for CUDA (~1% train speedup, free); streaming decode is unaffected
-# (T_q=1 falls through). MPS SDPA has no flash backend to unlock.
+# (T_q=1 falls through).
 if torch.cuda.is_available():
     enable_causal_sdpa()
 
@@ -174,58 +149,15 @@ class CachedCodeDataset(Dataset):
         sort_by_length: bool,
         max_samples: int,
         max_frames: int = 0,
-        cache_weights: list[float] | None = None,
-        seed: int = 0,
-        sample_manifest: Path | None = None,
-        sample_manifest_sha256: str | None = None,
     ):
         self.samples: list[dict[str, Any]] = []
         self.frame_rate: float | None = None
         dropped = 0
         cache_dirs = [cache_dir] if isinstance(cache_dir, Path) else list(cache_dir)
-        self.cache_count = len(cache_dirs)
-        if (sample_manifest is None) != (sample_manifest_sha256 is None):
-            raise ValueError("Input sample manifest and SHA-256 must be set together")
-        manifest_keys: list[tuple[int, str]] | None = None
-        samples_by_key: dict[tuple[int, str], dict[str, Any]] = {}
-        if sample_manifest is not None and sample_manifest_sha256 is not None:
-            if max_samples or cache_weights is not None:
-                raise ValueError("Input sample manifest forbids max-sample and cache-weight sampling")
-            if sort_by_length:
-                raise ValueError("Input sample manifest requires exact order; disable length sorting")
-            content = sample_manifest.read_bytes()
-            digest = hashlib.sha256(content).hexdigest()
-            if digest != sample_manifest_sha256:
-                raise RuntimeError(
-                    f"Input sample manifest SHA-256 mismatch: {digest} != "
-                    f"{sample_manifest_sha256}"
-                )
-            manifest_keys = []
-            for line_no, line in enumerate(content.decode("utf-8").splitlines(), 1):
-                row = json.loads(line)
-                if not isinstance(row, dict) or set(row) != {"cache_index", "id"}:
-                    raise ValueError(f"Invalid input sample manifest row {line_no}")
-                cache_index = row["cache_index"]
-                sample_id = row["id"]
-                if (
-                    isinstance(cache_index, bool)
-                    or not isinstance(cache_index, int)
-                    or not 0 <= cache_index < len(cache_dirs)
-                    or not isinstance(sample_id, str)
-                    or not sample_id
-                ):
-                    raise ValueError(f"Invalid input sample manifest row {line_no}")
-                manifest_keys.append((cache_index, sample_id))
-            if not manifest_keys:
-                raise ValueError("Input sample manifest is empty")
         shard_paths = [p for d in cache_dirs for p in sorted(d.glob("shard_*.pt"))]
         for shard_path in shard_paths:
-            cache_index = next(
-                index for index, directory in enumerate(cache_dirs) if shard_path.parent == directory
-            )
             payload = torch.load(shard_path, map_location="cpu")
-            cache_format = payload.get("format")
-            if cache_format not in SUPPORTED_CACHE_FORMATS:
+            if payload.get("format") != CACHE_FORMAT:
                 raise RuntimeError(f"Unsupported cache format in {shard_path}")
             frame_rate = float(payload["frame_rate"])
             if self.frame_rate is None:
@@ -238,134 +170,26 @@ class CachedCodeDataset(Dataset):
                 codes = sample["codes"]
                 if codes.ndim != 2:
                     raise RuntimeError(f"{shard_path} id={sample.get('id')} codes must be [K,T]")
-                if manifest_keys is None and max_frames and codes.shape[1] > max_frames:
+                if max_frames and codes.shape[1] > max_frames:
                     dropped += 1
                     continue
-                item = {
-                    "id": str(sample["id"]),
-                    # int32 in host RAM (halves footprint at ~700k samples);
-                    # collate_cached casts to long on batch assembly.
-                    "codes": codes.to(torch.int32),
-                    "frames": int(codes.shape[1]),
-                    "source_frames": int(sample["vi_frames"]),
-                    "cache_format": str(cache_format),
-                    "stratum": str(sample.get("stratum", "legacy_unspecified")),
-                    "split": str(sample.get("split", "")),
-                    "speaker_id": str(sample.get("speaker_id", "")),
-                    "gender": str(sample.get("gender", "")),
-                    "cache_index": cache_index,
-                }
-                if manifest_keys is None:
-                    self.samples.append(item)
-                else:
-                    key = (cache_index, item["id"])
-                    if key in samples_by_key:
-                        raise RuntimeError(f"Duplicate cached sample for cache_index,id={key}")
-                    samples_by_key[key] = item
-        if manifest_keys is not None:
-            missing = [key for key in manifest_keys if key not in samples_by_key]
-            if missing:
-                raise RuntimeError(f"Input sample manifest references missing samples: {missing[:10]}")
-            self.samples = [samples_by_key[key] for key in manifest_keys]
-            self.require_max_frames(max_frames, "Input sample manifest")
+                self.samples.append(
+                    {
+                        "id": str(sample["id"]),
+                        # int32 in host RAM; collate_cached casts to long.
+                        "codes": codes.to(torch.int32),
+                        "frames": int(codes.shape[1]),
+                        "source_frames": int(sample["ewe_frames"]),
+                    }
+                )
         if not self.samples:
-            raise RuntimeError(f"No shard_*.pt cache files found in {cache_dir}")
+            raise RuntimeError(f"No usable shard_*.pt samples found in {cache_dir}")
         if max_frames and dropped:
             print(f"[dataset] dropped {dropped} samples over {max_frames} frames; kept {len(self.samples)}")
-        if cache_weights is not None:
-            self.select_weighted(cache_weights, max_samples, seed)
-            max_samples = 0
         if sort_by_length:
             self.samples.sort(key=lambda sample: sample["frames"])
         if max_samples:
             self.samples = self.samples[:max_samples]
-            if not self.samples:
-                raise RuntimeError("--max-samples selected no cached samples")
-
-    def select_weighted(
-        self, cache_weights: list[float], max_samples: int, seed: int
-    ) -> None:
-        if len(cache_weights) != self.cache_count or any(
-            weight <= 0 for weight in cache_weights
-        ):
-            raise ValueError("--cache-weights must provide one positive weight per --cache-dir")
-        weight_total = sum(cache_weights)
-        pools = [
-            [sample for sample in self.samples if sample["cache_index"] == cache_index]
-            for cache_index in range(len(cache_weights))
-        ]
-        if any(not pool for pool in pools):
-            raise RuntimeError("Every weighted cache directory must have usable samples")
-        target_total = max_samples or max(
-            math.ceil(len(pool) * weight_total / weight)
-            for pool, weight in zip(pools, cache_weights, strict=True)
-        )
-        counts: list[int] = []
-        if max_samples:
-            quotas = [target_total * weight / weight_total for weight in cache_weights]
-            if any(
-                not math.isclose(quota, round(quota), rel_tol=0.0, abs_tol=1e-8)
-                for quota in quotas
-            ):
-                raise ValueError(
-                    "--max-samples must permit exact integer --cache-weights counts"
-                )
-            counts = [round(quota) for quota in quotas]
-            if sum(counts) != target_total:
-                raise RuntimeError("Exact cache-weight counts do not sum to --max-samples")
-        else:
-            remaining = target_total
-            for cache_index, weight in enumerate(cache_weights):
-                count = (
-                    remaining
-                    if cache_index == len(cache_weights) - 1
-                    else round(target_total * weight / weight_total)
-                )
-                counts.append(count)
-                remaining -= count
-        rng = random.Random(seed)
-        balanced: list[dict[str, Any]] = []
-        for pool, count in zip(pools, counts, strict=True):
-            if count <= len(pool):
-                balanced.extend(rng.sample(pool, count))
-            else:
-                balanced.extend(pool)
-                balanced.extend(rng.choices(pool, k=count - len(pool)))
-        self.samples = balanced
-
-    def filter_max_frames(self, max_frames: int, label: str) -> None:
-        if max_frames <= 0:
-            raise ValueError("Frame filtering requires a positive maximum")
-        before = len(self.samples)
-        self.samples = [sample for sample in self.samples if sample["frames"] <= max_frames]
-        if not self.samples:
-            raise RuntimeError(f"{label} selected no samples at T<={max_frames}")
-        print(
-            f"[dataset] {label}: dropped {before - len(self.samples)} samples over "
-            f"{max_frames} frames; kept {len(self.samples)}"
-        )
-
-    def require_max_frames(self, max_frames: int, label: str) -> None:
-        if not max_frames or not self.samples:
-            return
-        observed = max(sample["frames"] for sample in self.samples)
-        if observed > max_frames:
-            over = sum(sample["frames"] > max_frames for sample in self.samples)
-            raise RuntimeError(
-                f"{label} exceeds --max-frames={max_frames}: "
-                f"{over} entries, observed max T={observed}"
-            )
-
-    def shuffle_batch_order(self, batch_size: int, seed: int = 1234) -> None:
-        """Shuffle length-sorted samples in whole-batch blocks.
-
-        Batches stay near-uniform length (minimal padding, few MPS shapes) but
-        the epoch is no longer an ascending-length curriculum replayed in the
-        same order every epoch. Deterministic, so sorted-resume skip still works.
-        """
-        blocks = [self.samples[i : i + batch_size] for i in range(0, len(self.samples), batch_size)]
-        random.Random(seed).shuffle(blocks)
-        self.samples = [sample for block in blocks for sample in block]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -383,25 +207,20 @@ class CachedCodeDataset(Dataset):
         }
 
 
-def sample_manifest_bytes(dataset: CachedCodeDataset) -> bytes:
-    return "".join(
-        json.dumps(
-            {"cache_index": sample["cache_index"], "id": sample["id"]},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-        for sample in dataset.samples
-    ).encode("utf-8")
+def bucketed_epoch_order(
+    dataset: CachedCodeDataset, batch_size: int, seed: int, epoch: int
+) -> list[int]:
+    """Length-sorted batches shuffled per epoch: low padding, deterministic for resume."""
+    order = sorted(range(len(dataset)), key=lambda index: dataset.samples[index]["frames"])
+    blocks = [order[i : i + batch_size] for i in range(0, len(order), batch_size)]
+    random.Random(f"{seed}:{epoch}").shuffle(blocks)
+    return [index for block in blocks for index in block]
 
 
-# Pad each batch's frame length up to a multiple of this. MPS compiles+caches a
-# Metal kernel graph per distinct tensor shape; the raw pool has 262 distinct
-# lengths, which balloons the GPU working set (26 GB wired, swap-thrash). Bucketing
-# collapses that to ~9 shapes. Loss-neutral: extra frames are -1 == zero_token_id,
-# masked out of both CE terms (see LMModel.forward logits_mask). CUDA launch
-# recipes override this to balance padding against compiled-shape reuse.
-FRAME_BUCKET = int(os.environ.get("HIBIKI_FRAME_BUCKET", "32"))
+# Pad each batch's frame length up to a multiple of this so torch.compile reuses
+# a small set of shapes. Loss-neutral: extra frames are -1 == zero_token_id,
+# masked out of both CE terms (see LMModel.forward logits_mask).
+FRAME_BUCKET = int(os.environ.get("HIBIKI_FRAME_BUCKET", "16"))
 
 
 def collate_cached(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -409,19 +228,14 @@ def collate_cached(samples: list[dict[str, Any]]) -> dict[str, Any]:
     max_frames = max(int(sample["codes"].shape[1]) for sample in samples)
     max_frames = ((max_frames + FRAME_BUCKET - 1) // FRAME_BUCKET) * FRAME_BUCKET
     batch = torch.full((len(samples), codebooks, max_frames), -1, dtype=torch.long)
-    ids: list[str] = []
-    strata: list[str] = []
     for index, sample in enumerate(samples):
         codes = sample["codes"]
         batch[index, :, : codes.shape[1]] = codes
-        ids.append(sample["id"])
-        strata.append(sample["stratum"])
     return {
         "codes": batch,
-        "ids": ids,
+        "ids": [sample["id"] for sample in samples],
         "frames": torch.tensor([sample["frames"] for sample in samples]),
         "source_frames": torch.tensor([sample["source_frames"] for sample in samples]),
-        "strata": strata,
     }
 
 

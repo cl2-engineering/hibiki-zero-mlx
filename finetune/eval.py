@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mimi-weight", type=Path, default=DEFAULT_MIMI_WEIGHT)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
     parser.add_argument("--hf-repo", default="kyutai/hibiki-zero-3b-pytorch-bf16")
-    parser.add_argument("--device", default="mps")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16", help="Model dtype."
     )
@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-json", type=Path, help="Metrics JSON path; default <out-dir>/metrics.json.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tag", default="sft")
-    parser.add_argument("--source-column", default="vi_audio")
+    parser.add_argument("--source-column", default="ewe_audio")
     parser.add_argument("--reference-column", default="text_en")
     parser.add_argument("--id-column", default="id")
     return parser.parse_args()

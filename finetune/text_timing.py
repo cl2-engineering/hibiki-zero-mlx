@@ -1,4 +1,4 @@
-"""Word-time English text tokens for the grounded-v2 training cache."""
+"""CTC word-timing of the English target text for the training cache."""
 
 from __future__ import annotations
 
@@ -420,9 +420,6 @@ class EnglishCTCAligner:
             if any(result is None for result in batch_results):
                 raise RuntimeError("Missing CTC alignment result")
             results.extend(batch_results)  # type: ignore[arg-type]
-            if self.device.type == "mps":
-                del inputs, input_values, attention_mask, logits, input_lengths
-                torch.mps.empty_cache()
         return results
 
 
