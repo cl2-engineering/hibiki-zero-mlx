@@ -242,7 +242,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def train(args: argparse.Namespace) -> None:
     validate_args(args)
     if not torch.cuda.is_available():
-        raise RuntimeError("Parallel-head training requires CUDA; MLX is quantize/inference only")
+        raise RuntimeError("Parallel-head training requires CUDA")
     if (
         args.resume_optimizer is not None
         and args.resume_optimizer.parent.resolve() != args.out_dir.resolve()

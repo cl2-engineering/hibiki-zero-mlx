@@ -7,9 +7,19 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from moshi.models import LMGen, loaders
+from moshi.utils.compile import CUDAGraphed
+from moshi.utils.sampling import sample_token
+from safetensors.torch import load_file
 from torch import nn
 
-from student.contract import build_meta_ar_model, read_config, sha256, validate_config
+from student.contract import (
+    build_meta_ar_model,
+    read_config,
+    sha256,
+    torch_lm_config,
+    validate_config,
+)
 from student.harness import checkpoint_shapes, require_exact_shapes
 
 PARALLEL_PARAMETERS = 7_346_176
@@ -114,7 +124,15 @@ class ParallelHead(nn.Module):
             int(previous_codes.min()) < 0 or int(previous_codes.max()) > self.card
         ):
             raise ValueError(f"previous_codes must be in [0, {self.card}]")
+        return self.logits(hidden, text_embedding, previous_codes)
 
+    def logits(
+        self,
+        hidden: torch.Tensor,
+        text_embedding: torch.Tensor,
+        previous_codes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Unchecked forward (no host syncs), safe inside CUDA graph capture."""
         context = self.context_projection(hidden + text_embedding).unsqueeze(2)
         base = (
             context
@@ -167,3 +185,63 @@ def validate_ar_checkpoint(
         raise RuntimeError("AR checkpoint SHA-256 does not match the explicit SHA")
     require_exact_ar_checkpoint(checkpoint_path, cfg)
     return cfg
+
+
+AR_HEAD_MODULES = (
+    "depformer",
+    "depformer_in",
+    "depformer_emb",
+    "depformer_text_emb",
+    "depformer_norms",
+    "linears",
+)
+
+
+def load_parallel_lm(
+    cfg: dict[str, Any], checkpoint: Path, device: torch.device, dtype: torch.dtype
+) -> Any:
+    """Load a `student.export_parallel` checkpoint: AR backbone without its depformer
+    plus `parallel_head.*`, strictly."""
+    lm = loaders.get_moshi_lm(None, lm_kwargs=torch_lm_config(cfg), device="meta", dtype=dtype)
+    for name in AR_HEAD_MODULES:
+        setattr(lm, name, None)
+    with torch.device("meta"):
+        lm.parallel_head = ParallelHead.from_config(cfg)
+    state = load_file(str(checkpoint), device=str(device))
+    for name, value in state.items():
+        if value.dtype.is_floating_point:
+            keep_fp32 = name.startswith(("condition_provider.", "fuser."))
+            state[name] = value.float() if keep_fp32 else value.to(dtype)
+    lm.load_state_dict(state, strict=True, assign=True)
+    # Same early-EOS-as-PAD input trick moshi's CheckpointInfo.get_moshi applies.
+    lm.text_emb.weight.data[2] = lm.text_emb.weight.data[3]
+    return lm
+
+
+class ParallelLMGen(LMGen):
+    """moshi LMGen whose audio step is the parallel_v1 head.
+
+    Mirrors the training capture: the head sees the normalized backbone output,
+    the embedding of the sampled text token, and the previous raw pre-undelay
+    head frame (initially `card`).
+    """
+
+    def _init_streaming_state(self, batch_size: int) -> Any:
+        state = super()._init_streaming_state(batch_size)
+        lm = self.lm_model
+        self.previous_codes = torch.full(
+            (batch_size, lm.dep_q), lm.card, device=lm.device, dtype=torch.long
+        )
+        state.graphed_depth = CUDAGraphed(self.depformer_step, disable=lm.device.type != "cuda")
+        return state
+
+    def depformer_step(self, text_token: torch.Tensor, transformer_out: torch.Tensor) -> torch.Tensor:
+        if self.cfg_coef != 1.0:
+            raise ValueError("parallel_v1 does not support classifier-free guidance")
+        lm = self.lm_model
+        logits = lm.parallel_head.logits(
+            transformer_out, lm.text_emb(text_token[:, None]), self.previous_codes[:, None]
+        )
+        tokens = sample_token(logits.float(), self.use_sampling, self.temp, self.top_k)[:, 0]
+        self.previous_codes.copy_(tokens)  # in place, so CUDA graph replay updates it
+        return tokens

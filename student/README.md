@@ -4,7 +4,7 @@ The active path is deliberately short:
 
 ```text
 official 1B init -> BF16 AR distillation -> BF16 parallel-head distillation
--> BF16 export -> MLX BF16 sample translation
+-> BF16 export -> PyTorch CUDA sample translation (main.py)
 ```
 
 There is no automatic quality validation, benchmark, qualification receipt, or
@@ -21,7 +21,7 @@ cache schemas, checkpoint pairs, and base/head lineage must still match.
 - `student.export_parallel` casts the final listening checkpoint to BF16.
 
 Training the optimizer masters directly in BF16 is not supported. It saves
-little H100 memory and weakens small parameter updates.
+little GPU memory and weakens small parameter updates.
 
 ## 1. Measure and initialize
 
@@ -29,10 +29,10 @@ The AR intermediate keeps the official Hibiki-M width and ordinary depformer.
 The listening candidate replaces that large head with `parallel_v1`.
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.contract receipt \
+.venv/bin/python -m student.contract receipt \
   --config student/configs/hibiki_m_12l_ar.json
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.initialize \
+.venv/bin/python -m student.initialize \
   --config student/configs/hibiki_m_12l_ar.json \
   --parent-config PATH/TO/OFFICIAL/config.json \
   --parent-weights PATH/TO/OFFICIAL/hibikim-pytorch.safetensors \
@@ -47,17 +47,17 @@ Input rows contain `id`, `split`, `source_audio`, `target_audio`,
 including EOS, on the 12.5 Hz timeline.
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.cache build \
+.venv/bin/python -m student.cache build \
   --pairs PAIRS.jsonl --out-dir CACHE
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.cache build \
+.venv/bin/python -m student.cache build \
   --pairs PAIRS.jsonl --out-dir TEACHER_CACHE --role teacher_context \
   --config TEACHER/config.json --weights TEACHER/model.safetensors \
   --repo kyutai/hibiki-zero-3b-pytorch-bf16 \
   --revision 73175ce6243f8ad66b2138b0264a80044b35c1bd \
   --mimi TEACHER/mimi.safetensors --tokenizer TEACHER/tokenizer.model
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.dump_teacher \
+.venv/bin/python -m student.dump_teacher \
   --teacher-cache TEACHER_CACHE --student-cache CACHE \
   --teacher-config TEACHER/config.json --teacher-weights TEACHER/model.safetensors \
   --teacher-repo kyutai/hibiki-zero-3b-pytorch-bf16 \
@@ -75,7 +75,7 @@ selected sample must contain real teacher speech re-encoded by the student Mimi.
 ```bash
 INIT_SHA=$(sha256sum RUN/init.safetensors | cut -d' ' -f1)
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.train train \
+.venv/bin/python -m student.train train \
   --cache-dir DISTILL_CACHE \
   --init-checkpoint RUN/init.safetensors --init-sha256 "$INIT_SHA" \
   --out-dir RUN/ar_distill --steps 10000 \
@@ -99,11 +99,11 @@ AR-head distributions.
 AR=RUN/ar_distill/model_step010000.safetensors
 AR_SHA=$(sha256sum "$AR" | cut -d' ' -f1)
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.capture_parallel \
+.venv/bin/python -m student.capture_parallel \
   --cache-dir DISTILL_CACHE --ar-checkpoint "$AR" --ar-sha256 "$AR_SHA" \
   --out-dir RUN/parallel_cache
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.train_parallel train \
+.venv/bin/python -m student.train_parallel train \
   --cache-dir RUN/parallel_cache \
   --ar-checkpoint "$AR" --ar-sha256 "$AR_SHA" \
   --out-dir RUN/parallel_head --steps 10000
@@ -119,24 +119,25 @@ by their hashes.
 HEAD=RUN/parallel_head/head_step010000.safetensors
 HEAD_SHA=$(sha256sum "$HEAD" | cut -d' ' -f1)
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python -m student.export_parallel \
+.venv/bin/python -m student.export_parallel \
   --base-checkpoint "$AR" --base-sha256 "$AR_SHA" \
   --head-checkpoint "$HEAD" --head-sha256 "$HEAD_SHA" \
   --output-weights RUN/parallel/model.bf16.safetensors \
   --output-config RUN/parallel/config.json
 
-/opt/homebrew/Caskroom/miniconda/base/bin/python scripts/convert_mlx_bf16.py \
-  --checkpoint RUN/parallel/model.bf16.safetensors \
+.venv/bin/python main.py assets/samples/leon.wav \
   --config RUN/parallel/config.json \
-  --mimi weights/mimi-pytorch-e351c8d8@125.safetensors \
-  --tokenizer weights/tokenizer_spm_48k_multi6_2.model \
-  --out-dir RUN/parallel_mlx_bf16
-
-/opt/homebrew/Caskroom/miniconda/base/bin/python main.py assets/samples/leon.wav \
-  --model RUN/parallel_mlx_bf16 \
+  --checkpoint RUN/parallel/model.bf16.safetensors \
   --out RUN/listen/leon.wav \
   --text-out RUN/listen/leon.txt
 ```
+
+The AR intermediate is also listenable directly with
+`--config student/configs/hibiki_m_12l_ar.json --checkpoint "$AR"`. Mimi and the
+tokenizer come from `weights/`. `main.py` runs `parallel_v1` through
+`student.parallel.ParallelLMGen`: the head sees the normalized backbone output,
+the embedding of the sampled text token, and the previous raw pre-undelay head
+frame, exactly as captured for training.
 
 The last command is the current decision gate: listen to the WAV and inspect
 the text. Keep the exact checkpoint and sample outputs you chose; no receipt is

@@ -1,156 +1,121 @@
 #!/usr/bin/env python
-"""hibiki-zero MLX translation — realtime mic or a file, on q4 or bf16 weights.
+"""Hibiki-Zero file translation on CUDA (PyTorch, bf16).
 
-  python main.py path/to/audio.wav      # file  -> translations/<stem>_translated.wav
-  python main.py --mic                  # mic   -> speakers, live (Ctrl-C to stop)
+  .venv/bin/python main.py input.wav                       # upstream weights/
+  .venv/bin/python main.py input.wav --checkpoint finetune/runs/ewe_full/best.safetensors
+  .venv/bin/python main.py input.wav --config student/configs/hibiki_m_12l_ar.json \\
+      --checkpoint RUN/ar_distill/model_step010000.safetensors
 
-You get streamed EN text + 24 kHz EN audio. Both modes use hibiki_mlx.pipeline
-(load()/run()); --model accepts the 3B q4 default or a staged q4/bf16 Hibiki-Zero
-model directory. File mode is the 3-thread
-pipelined path; mic mode pipelines encode->LM->decode across threads so the live
-critical path is just the LM step (~22 ms on M4 for 3B, budget 80 ms).
+Writes the translated 24 kHz speech (default translations/<stem>_translated.wav)
+and its text (default: the wav path with .txt). An 8 s silence tail flushes the
+simultaneous-translation lag; generation stops at the text EOS.
 """
 import argparse
-import queue
-import sys
-import threading
+import json
+import time
 from pathlib import Path
 
-import mlx.core as mx
-import numpy as np
+import sphn
+import torch
+from moshi.models import LMGen, loaders
+from moshi.run_inference import get_condition_tensors
 
-from hibiki_mlx import pipeline as f
-from moshi_mlx import models, utils
+from finetune.hibiki_helpers import audio_read, decode_outputs, encode_inputs
+from finetune.utils import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_MIMI_WEIGHT,
+    DEFAULT_MODEL_WEIGHT,
+    DEFAULT_TOKENIZER,
+    REPO_ROOT,
+)
 
-ROOT = Path(__file__).resolve().parent
 
-FRAME = 1920  # samples @ 24 kHz = one 12.5 Hz codec frame (80 ms)
-
-
-def run_mic(max_steps: int, weights_dir: Path = f.W, text_temp: float = 0.4):
-    import sounddevice as sd
-
-    print("loading MLX weights ...")
-    model, lm_config, text_tok, mimi_enc, mimi_dec = f.load(weights_dir)
-    special_text_tokens = f.text_special_ids(text_tok)
-    ct = None
-    if model.condition_provider is not None:
-        ct = model.condition_provider.condition_tensor("description", "very_good")
-    other_cb = lm_config.other_codebooks
-    gen_cb = lm_config.generated_codebooks
-    gen = models.LmGen(
-        model=model, max_steps=max_steps,
-        text_sampler=utils.Sampler(top_k=25, temp=text_temp),
-        audio_sampler=utils.Sampler(top_k=250, temp=0.8),
-        cfg_coef=1.0, check=False,
+def load(args: argparse.Namespace):
+    """Return (lm, lm_gen, mimi, tokenizer) for an upstream, fine-tuned, or student checkpoint."""
+    info = loaders.CheckpointInfo.from_hf_repo(
+        "kyutai/hibiki-zero-3b-pytorch-bf16",
+        moshi_weights=args.checkpoint,
+        mimi_weights=DEFAULT_MIMI_WEIGHT,
+        tokenizer=DEFAULT_TOKENIZER,
+        config_path=args.config,
     )
-    model.warmup(ct)
-    mx.eval(model.parameters())
+    cfg = json.loads(Path(args.config).read_text())
+    gen_cls = LMGen
+    if cfg.get("head") is None:  # upstream / fine-tuned Hibiki-Zero
+        lm = info.get_moshi(device=args.device, dtype=torch.bfloat16)
+    else:  # student config: strip student metadata moshi doesn't understand
+        from student.contract import torch_lm_config
 
-    in_q: queue.Queue = queue.Queue()
-    enc_q: queue.Queue = queue.Queue()                # encoder -> LM
-    dec_q: queue.Queue = queue.Queue()                # LM -> decoder
-    out_q: queue.Queue = queue.Queue()
-    stop = threading.Event()
+        info.lm_config = torch_lm_config(info.lm_config)
+        if cfg["head"] == "parallel_v1":
+            from student.parallel import ParallelLMGen, load_parallel_lm
 
-    def on_input(indata, frames, t, status):
-        in_q.put_nowait(indata[:, 0].copy())          # (1920,) float32 mic frame
+            lm = load_parallel_lm(cfg, Path(args.checkpoint), torch.device(args.device), torch.bfloat16)
+            gen_cls = ParallelLMGen
+        else:
+            lm = info.get_moshi(device=args.device, dtype=torch.bfloat16)
+    lm.eval()
+    conditions = get_condition_tensors(info.model_type, lm, batch_size=1, cfg_coef=1.0)
+    lm_gen = gen_cls(lm, condition_tensors=conditions, **info.lm_gen_config)
+    mimi = info.get_mimi(device=args.device)
+    return lm, lm_gen, mimi, info.get_text_tokenizer()
 
-    def on_output(outdata, frames, t, status):
-        try:
-            outdata[:, 0] = out_q.get_nowait()         # translated EN PCM
-        except queue.Empty:
-            outdata.fill(0)                            # not ready yet -> silence
 
-    # Pipeline the codec off the main LM thread (same trick as the file path): encode
-    # and decode are CPU (GIL-free) and independent of the LM recurrence, so the
-    # live critical path collapses from encode+LM+decode (~58 ms) to just the LM
-    # step (~24 ms on M4). Costs one frame (80 ms) of extra output latency.
-    def encoder():
-        # Queue numpy (not mx) arrays: lazy mx graphs are bound to the creating
-        # thread's stream and can't be evaluated from the LM thread.
-        while not stop.is_set():
-            try:
-                pcm = in_q.get(timeout=0.1)
-            except queue.Empty:
+def translate(args: argparse.Namespace) -> None:
+    lm, lm_gen, mimi, tokenizer = load(args)
+    wav = audio_read(Path(args.input), to_sample_rate=mimi.sample_rate, mono=True)[0]
+    duration = wav.shape[-1] / mimi.sample_rate
+    padded = torch.zeros(1, 1, int((duration + args.tail_s) * mimi.sample_rate))
+    padded[0, :, : wav.shape[-1]] = wav[:1]
+    codes, warmup_codes = encode_inputs(padded, mimi, lm_gen, [duration])
+
+    eos_id = tokenizer.eos_id()
+    text_tokens, audio_tokens = [], []
+    start = time.perf_counter()
+    with torch.no_grad(), lm_gen.streaming(1):
+        for step in range(warmup_codes.shape[-1]):
+            lm_gen.step(warmup_codes[:, :, step : step + 1])
+        for step in range(codes.shape[-1]):
+            tokens = lm_gen.step(codes[:, :, step : step + 1])
+            if tokens is None:
                 continue
-            codes = mimi_enc.encode_step(pcm[None, None, :])             # CPU, GIL free
-            enc_q.put_nowait(np.transpose(codes, (0, 2, 1))[0, :, :other_cb])
+            text_tokens.append(tokens[:, 0])
+            audio_tokens.append(tokens[:, 1:])
+            if int(tokens[0, 0, 0]) == eos_id:
+                break
+    wall = time.perf_counter() - start
+    (out_wav, text), = decode_outputs(
+        torch.cat(audio_tokens, dim=-1), torch.cat(text_tokens, dim=-1), mimi, tokenizer
+    )
 
-    def decoder():
-        while not stop.is_set():
-            try:
-                at = dec_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            out = mimi_dec.decode_step(at)                              # CPU, GIL free
-            out_q.put_nowait(out[0, 0])                                 # (1920,) float32
-
-    workers = [threading.Thread(target=fn, daemon=True) for fn in (encoder, decoder)]
-    for worker in workers:
-        worker.start()
-    try:
-        with sd.InputStream(samplerate=24000, channels=1, blocksize=FRAME,
-                            dtype="float32", callback=on_input), \
-             sd.OutputStream(samplerate=24000, channels=1, blocksize=FRAME,
-                             dtype="float32", callback=on_output):
-            print(f"listening — translated EN plays back. Ctrl-C to stop "
-                  f"(cap {max_steps / 12.5 / 60:.0f} min)\n")
-            while not stop.is_set():
-                try:
-                    codes = enc_q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                tt = gen.step(mx.array(codes), ct)
-                tok = tt[0].item()                                       # sync this frame
-                if tok not in special_text_tokens:
-                    sys.stdout.write(text_tok.id_to_piece(tok).replace("▁", " "))
-                    sys.stdout.flush()
-                audio = gen.last_audio_tokens()
-                if audio is not None and gen_cb > 0:
-                    dec_q.put_nowait(np.array(audio[:, :, None]).astype(np.uint32))
-    except ValueError as e:                                             # reached max_steps
-        print(f"\n[reached cap: {e}]")
-    except KeyboardInterrupt:
-        print("\n[stopping]")
-    finally:
-        stop.set()
-        for worker in workers:
-            worker.join()
+    out = Path(args.out or REPO_ROOT / "translations" / f"{Path(args.input).stem}_translated.wav")
+    text_out = Path(args.text_out) if args.text_out else out.with_suffix(".txt")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    text_out.parent.mkdir(parents=True, exist_ok=True)
+    sphn.write_wav(out, out_wav[0].float().numpy(), mimi.sample_rate)
+    text_out.write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(
+        f"\n[{duration:.1f}s input, {len(text_tokens)} frames in {wall:.1f}s "
+        f"({duration / wall:.2f}x RT), out: {out} ({out_wav.shape[-1] / mimi.sample_rate:.1f}s), "
+        f"text: {text_out}]"
+    )
 
 
-def main():
-    p = argparse.ArgumentParser(description="hibiki-zero MLX translation (mic or file)")
-    p.add_argument("input", nargs="?", help="audio file to translate")
-    p.add_argument("--mic", action="store_true", help="realtime mic -> speakers")
-    p.add_argument("-o", "--out", help="output wav (file mode); default translations/<stem>_translated.wav")
-    p.add_argument("--text-out", help="output text transcript (file mode); default matches output wav with .txt")
-    p.add_argument("--model", default="3b", help="3b or a q4/bf16 Hibiki-Zero model directory")
-    p.add_argument("--text-temp", type=float, default=0.4, help="text sampling temperature (default 0.4)")
-    p.add_argument("--minutes", type=float, default=30.0, help="mic session cap (default 30)")
+def main() -> None:
+    p = argparse.ArgumentParser(description="Hibiki-Zero file translation (PyTorch CUDA)")
+    p.add_argument("input", help="audio file to translate")
+    p.add_argument("--checkpoint", type=Path, default=DEFAULT_MODEL_WEIGHT,
+                   help="LM safetensors: upstream, finetune/train.py output, or student export")
+    p.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="LM config.json")
+    p.add_argument("-o", "--out", help="output wav; default translations/<stem>_translated.wav")
+    p.add_argument("--text-out", help="output text; default the output wav with .txt")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--tail-s", type=float, default=8.0, help="silence appended to flush the lag")
+    p.add_argument("--seed", type=int, default=299792458)
     args = p.parse_args()
-
-    weights_dir = f.resolve_weights_dir(args.model)
-    mx.random.seed(299792458)
-    if args.mic or args.input == "mic":
-        run_mic(
-            max_steps=int(args.minutes * 60 * 12.5) + 8,
-            weights_dir=weights_dir,
-            text_temp=args.text_temp,
-        )
-    elif args.input:
-        infile = args.input
-        out = args.out or str(ROOT / "translations" / f"{Path(infile).stem}_translated.wav")
-        Path(out).parent.mkdir(parents=True, exist_ok=True)
-        f.run(
-            infile,
-            out,
-            weights_dir=weights_dir,
-            text_outfile=args.text_out,
-            text_temp=args.text_temp,
-        )
-    else:
-        p.error("give an audio file path, or --mic for realtime")
+    torch.manual_seed(args.seed)
+    translate(args)
 
 
 if __name__ == "__main__":
