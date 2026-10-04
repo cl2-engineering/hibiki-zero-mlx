@@ -25,7 +25,7 @@ utt0002,validation,audio/ee/utt0002.wav,audio/en/utt0002.wav,,Thank you very muc
 ## 2. Workflow
 
 ```bash
-finetune/gb10.sh setup                  # moshi 0.2.13 + deps into .venv
+finetune/gb10.sh setup                  # uv sync --extra training (.venv)
 finetune/gb10.sh pairs path/to/manifest.csv   # -> finetune/pairs/{split}.jsonl
 finetune/gb10.sh cache                  # -> finetune/cache/{train,validation}
 finetune/gb10.sh smoke                  # optional 10-step check

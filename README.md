@@ -1,98 +1,80 @@
-# Hibiki MLX
+# Hibiki Ewe
 
-Hibiki-Zero speech translation with two maintained paths:
+Ewe → English simultaneous speech-to-speech translation built on
+[Hibiki-Zero](https://github.com/kyutai-labs/hibiki-zero)
+([paper](https://arxiv.org/abs/2602.11072), weights license CC BY-NC-SA 4.0).
+Training and inference run with PyTorch on CUDA, targeting a local NVIDIA GB10
+(DGX Spark, aarch64, CUDA 13).
 
-- q4 MLX inference on Apple Silicon for FR/ES/PT/DE → English;
-- full-model PyTorch SFT on CUDA for Vietnamese → English.
-
-Upstream: [kyutai-labs/hibiki-zero](https://github.com/kyutai-labs/hibiki-zero) ·
-[paper](https://arxiv.org/abs/2602.11072) · weights license CC BY-NC-SA 4.0.
-
-## Inference
+## Setup
 
 ```bash
-pip install -e ./moshi-mlx
-pip install -e .
+uv sync --extra training   # torch cu130 + moshi 0.2.13 into .venv
 ```
 
-Download and convert the 3B checkpoint:
+`pyproject.toml` pulls torch from the cu130 index and overrides moshi's stale
+torch/huggingface-hub/numpy/safetensors pins. Drop `--extra training` for
+inference only.
+
+Download the upstream 3B weights (file names are what `finetune/utils.py` expects):
 
 ```bash
-hf download kyutai/hibiki-zero-3b-pytorch-bf16 \
+.venv/bin/hf download kyutai/hibiki-zero-3b-pytorch-bf16 \
   config.json \
   "hibiki-pytorch-77f82164@110.safetensors" \
   "mimi-pytorch-e351c8d8@125.safetensors" \
   tokenizer_spm_48k_multi6_2.model \
   --local-dir weights
-python scripts/convert_mlx_q4.py
 ```
 
-Run file or microphone translation:
+## Inference
+
+File translation only:
 
 ```bash
-python main.py assets/samples/leon.wav
-python main.py --mic
+.venv/bin/python main.py assets/samples/leon.wav            # upstream weights
+.venv/bin/python main.py input.wav --checkpoint finetune/runs/ewe_full/best.safetensors
 ```
 
-Build and open the native macOS test app:
-
-```bash
-./macos/HibikiTestApp/build.sh
-open "macos/HibikiTestApp/build/Hibiki Test.app"
-```
-
-The SwiftUI app provides model and audio pickers, file translation and playback,
-live microphone start/stop, the English transcript, and the backend log. It runs
-`main.py` with the conda Python at `/opt/homebrew/Caskroom/miniconda/base/bin/python`.
-
-`main.py` and `hibiki_mlx.pipeline` overlap the CPU Mimi encoder/decoder with the
-GPU language model. `--model` accepts `3b` or a staged q4/BF16 Hibiki-Zero model
-directory.
-
-The maintained inference utilities are:
-
-- `scripts/convert_mlx_q4.py`: convert the 3B PyTorch LM to MLX q4.
-- `scripts/convert_mlx_bf16.py`: stage an exact BF16 checkpoint for MLX listening.
-- `scripts/verify_mlx_q4.py`: translate the checked-in sample as a quality gate.
-- `scripts/bench.py`: stage timing and silence-input gate.
-- `scripts/check_swift_compat.py`: strict group-size-32 artifact validation.
+Writes `translations/<stem>_translated.wav` and a `.txt` transcript (`-o`,
+`--text-out` override). Student checkpoints also need `--config`; see
+`student/README.md`. Sampling follows the upstream config (text temperature 0.8,
+top-k 250).
 
 ## Training
 
-For an H100 pod, use the checked and pinned CUDA 13.2 workflow:
+Write a CSV manifest of paired Ewe and English speech:
 
-```bash
-./finetune/h100.sh setup
-./finetune/h100.sh preflight
-./finetune/h100.sh smoke
-./finetune/h100.sh train
+```csv
+id,split,ewe_audio,en_audio,text_ee,text_en
+utt0001,train,audio/ee/utt0001.wav,audio/en/utt0001.wav,Ŋdi nyuie,Good morning.
 ```
 
-For other CUDA development environments, install PyTorch followed by the
-training dependencies:
+English target audio is mandatory (there is no TTS step). Then:
 
 ```bash
-pip install -e '.[training]'
-pip install --no-deps moshi==0.2.13
+finetune/gb10.sh pairs path/to/manifest.csv
+finetune/gb10.sh cache
+finetune/gb10.sh smoke
+finetune/gb10.sh train
 ```
 
-Install the CUDA PyTorch build first. `--no-deps` prevents Moshi's stale Torch
-constraint from replacing it.
+Details, defaults, resume, and evaluation: [finetune/README.md](finetune/README.md).
+The 12-layer mobile distillation track is in [student/README.md](student/README.md).
 
-The only supported trainer is `finetune/train.py`: base-start, full-model SFT
-with fp32 master weights and CUDA bf16 autocast. Checkpoints are exact full-model
-states; partial or adapter checkpoints are rejected.
+## GB10 notes
 
-See [SFT mechanics](docs/finetune.md), the current
-[training recipe](docs/training_plan.md), and the
-[validation contract](docs/validation_plan.md).
+- 3B inference: ~8 GB GPU memory, ~1.34× real time.
+- Full fine-tuning: ~53 GB peak at batch 1 (fp32 masters + AdamW ≈ 48 GB).
+  The default batch 4 × accumulation 4 may need `--gradient-checkpointing` or a
+  smaller `--batch-size` for long rows.
+- Each checkpoint (model + optimizer) is ~37 GB; with the last two kept, budget
+  ~110 GB of disk.
 
 ## Layout
 
-- `hibiki_mlx/`: pipelined q4 inference runtime.
-- `moshi-mlx/`: minimal vendored MLX model implementation with Hibiki deltas.
-- `finetune/`: full-model SFT, cache preparation, and evaluation.
-- `remote_dataset/`: reproducible FLEURS downloader.
-- `macos/HibikiTestApp/`: native SwiftUI file and microphone test app.
-- `scripts/`: q4 conversion and inference verification.
-- `assets/samples/`: the retained inference gate clip.
+- `main.py`: CUDA file translation for upstream, fine-tuned, and student checkpoints.
+- `finetune/`: manifest → pairs → cache → full-model SFT → validation/eval.
+- `student/`: 12-layer AR and `parallel_v1` distillation.
+- `weights/`: upstream weights (gitignored).
+- `assets/samples/leon.wav`: French smoke-test clip for upstream inference.

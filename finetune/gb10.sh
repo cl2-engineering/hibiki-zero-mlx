@@ -17,10 +17,8 @@ cmd="${1:-}"
 shift || true
 case "$cmd" in
   setup)
-    # Installs into the existing venv; torch (CUDA 13 build) must already be there.
-    uv pip install --python "$PYTHON" --no-deps moshi==0.2.13
-    uv pip install --python "$PYTHON" einops sacrebleu safetensors sentencepiece sphn \
-      soundfile transformers num2words
+    # pyproject.toml pins torch (cu130 index) and moshi 0.2.13 with overrides for its stale pins.
+    uv sync --extra training
     "$PYTHON" -c "import torch, moshi; print(torch.__version__, torch.cuda.get_device_name())"
     ;;
   pairs)
